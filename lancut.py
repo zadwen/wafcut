@@ -29,10 +29,15 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+if __name__ == "__main__" and "--legacy" not in sys.argv:
+    from app import main
+    main()
+    sys.exit(0)
+
 try:
     from scapy.all import ARP, Ether, srp, send, conf
 except ImportError:
-    print("scapy isn't installed. Run: sudo pip install scapy --break-system-packages")
+    print("Install dependencies first: python3 -m pip install -r requirements.txt")
     raise SystemExit(1)
 
 conf.verb = 0  # scapy stays quiet
@@ -51,8 +56,7 @@ def has_raw_socket_privilege():
     except PermissionError:
         return False
     except Exception:
-        # some other issue (e.g. AF_PACKET weirdness) - don't block startup over it
-        return True
+        return False
 
 
 def get_default_iface():
@@ -129,26 +133,59 @@ def netbios_name(ip, timeout=1.0):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(timeout)
             s.sendto(packet, (ip, 137))
-            data, _ = s.recvfrom(2048)
+            data, peer = s.recvfrom(2048)
+            if peer != (ip, 137):
+                return None
     except Exception:
         return None
 
+    return parse_netbios_response(data, txn_id)
+
+
+def parse_netbios_response(data, txn_id):
+    """Parse NBSTAT with or without an echoed question and validate bounds."""
     try:
-        # skip header(12) + echoed question (33 bytes name field + 4 type/class)
-        # then answer name is usually a 2-byte pointer, then type(2)+class(2)+ttl(4)+rdlen(2)
-        pos = 12 + len(question)
-        pos += 2 + 2 + 2 + 4  # name pointer + type + class + ttl
-        rdlen = struct.unpack(">H", data[pos:pos + 2])[0]
-        pos += 2
-        num_names = data[pos]
-        pos += 1
-        for _ in range(num_names):
-            raw_name = data[pos:pos + 15].decode("ascii", errors="ignore").strip()
-            suffix = data[pos + 15]
-            if raw_name and suffix == 0x00:  # 0x00 = workstation/unique name
-                return raw_name
-            pos += 18
-    except Exception:
+        ident, flags, questions, answers, _, _ = struct.unpack_from('>6H', data)
+        if ident != txn_id or not flags & 0x8000 or flags & 0xF:
+            return None
+        def skip_name(pos):
+            for _ in range(128):
+                size = data[pos]
+                pos += 1
+                if size == 0:
+                    return pos
+                if size & 0xC0 == 0xC0:
+                    if pos >= len(data):
+                        raise ValueError('Truncated pointer')
+                    return pos + 1
+                if size > 63:
+                    raise ValueError('Invalid label')
+                pos += size
+            raise ValueError('Invalid name')
+        pos = 12
+        for _ in range(questions):
+            pos = skip_name(pos) + 4
+        for _ in range(answers):
+            pos = skip_name(pos)
+            kind, cls, ttl, length = struct.unpack_from('>HHIH', data, pos)
+            pos += 10
+            end = pos + length
+            if end > len(data):
+                return None
+            if kind == 0x21 and cls == 1 and length:
+                count = data[pos]
+                pos += 1
+                if pos + count * 18 > end:
+                    return None
+                for _ in range(count):
+                    name = data[pos:pos+15].decode('ascii', errors='replace').strip()
+                    suffix = data[pos+15]
+                    name_flags = struct.unpack_from('>H', data, pos+16)[0]
+                    if name and suffix == 0 and not name_flags & 0x8000:
+                        return name
+                    pos += 18
+            pos = end
+    except (IndexError, struct.error, ValueError):
         pass
     return None
 
@@ -363,6 +400,8 @@ class LanCutApp:
             return
         if not self.gw_mac:
             messagebox.showerror("lancut", "Gateway MAC not resolved yet, try again in a sec.")
+            return
+        if dev["ip"] in self.blockers:
             return
         b = Blocker(self.iface, self.gw_ip, self.gw_mac, dev["ip"], dev["mac"])
         b.start()
