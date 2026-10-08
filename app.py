@@ -179,6 +179,8 @@ class WafcutApp:
     def render(self):
         if not hasattr(self, 'tree'):
             return
+        selection = self.tree.selection()
+        selected_address = tuple(self.tree.item(selection[0], 'values')[:2]) if selection else None
         self.tree.delete(*self.tree.get_children())
         query = self.search.get().lower()
         for index, row in enumerate(self.rows):
@@ -186,6 +188,9 @@ class WafcutApp:
                       row.get('vendor', 'Unknown'), row.get('name_source', '') + ' / ' + row.get('evidence', ''), row['status'])
             if query in ' '.join(values).lower():
                 self.tree.insert('', 'end', iid=str(index), values=values)
+                if values[:2] == selected_address:
+                    self.tree.selection_set(str(index))
+                    self.tree.focus(str(index))
 
     def selected(self):
         selection = self.tree.selection()
